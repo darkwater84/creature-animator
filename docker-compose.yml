@@ -1,0 +1,177 @@
+name: monster-animation-studio
+
+x-common-env: &common-env
+  PYTHONUNBUFFERED: "1"
+  PYTHONDONTWRITEBYTECODE: "1"
+  WORKSPACE_DIR: /workspace
+  PROJECTS_DIR: /workspace/projects
+  MODELS_CACHE_DIR: /workspace/cache
+  HF_HOME: /workspace/cache/huggingface
+  TORCH_HOME: /workspace/cache/torch
+
+services:
+  # ============================================================================
+  # 1. Frontend Web Application (5-Step Creature Animation Stepper + 3D Viewer)
+  # ============================================================================
+  web-ui:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: monster-anim-webui
+    ports:
+      - "${WEB_PORT:-3000}:3000"
+    environment:
+      VITE_API_BASE_URL: http://localhost:${API_PORT:-8000}
+      VITE_WS_URL: ws://localhost:${API_PORT:-8000}/ws
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+    depends_on:
+      api-orchestrator:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ============================================================================
+  # 2. Backend API Orchestrator & DINOv2 Pipeline Service
+  #    Handles Stepper state, WebSocket logs, Step 3 (DINOv2 Feature Extraction
+  #    & Pose Regressor Training), Step 4 (Validation), and Step 5 (Inference).
+  # ============================================================================
+  api-orchestrator:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile.api
+    container_name: monster-anim-api
+    init: true
+    ports:
+      - "${API_PORT:-8000}:8000"
+    environment:
+      <<: *common-env
+      RIGGING_SERVICE_URL: http://rigging-worker:8001
+      BLENDER_SERVICE_URL: http://blender-worker:8002
+      DINOV2_REPO_PATH: /opt/dinov2
+      DEFAULT_PROJECT: ${ACTIVE_PROJECT:-spider-rider}
+      DEFAULT_FEATURE_MODEL: ${FEATURE_MODEL:-dinov2_vits14}
+      DEFAULT_EPOCHS: ${EPOCHS:-50}
+      DEFAULT_BATCH_SIZE: ${BATCH_SIZE:-16}
+      DEFAULT_FRAME_STRIDE: ${FRAME_STRIDE:-1}
+      DEVICE: ${DEVICE:-auto}
+    volumes:
+      - ./workspace:/workspace
+      - ./pipeline:/app/pipeline
+      - ./engines/dinov2:/app/pipeline/dinov2:ro
+      - ./engines/dinov2:/opt/dinov2:ro
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # ============================================================================
+  # 3. Auto-Rigging Worker (SkinTokens + UniRig on Python 3.11 via Astral uv)
+  #    Handles Step 1: Mesh Cleanup, SkinTokens (Option B, recommended for
+  #    monsters) and UniRig (Option A) with isolated uv virtual environments.
+  # ============================================================================
+  rigging-worker:
+    build:
+      context: ./workers/rigging
+      dockerfile: Dockerfile.rigging
+    container_name: monster-anim-rigging
+    init: true
+    expose:
+      - "8001"
+    ports:
+      - "${RIGGING_PORT:-8001}:8001"
+    environment:
+      <<: *common-env
+      SKINTOKIENS_ROOT: /opt/SkinTokens
+      UNIRIG_ROOT: /opt/UniRig
+      SKINTOKIENS_VENV: /opt/venvs/skintokens
+      UNIRIG_VENV: /opt/venvs/unirig
+      XFORMERS_IGNORE_FLASH_VERSION_CHECK: "1"
+      DEVICE: ${DEVICE:-auto}
+    volumes:
+      - ./workspace:/workspace
+      - ./engines/SkinTokens:/opt/SkinTokens
+      - ./engines/UniRig:/opt/UniRig
+      - ./scripts/verify:/opt/verify:ro
+      - rigging-venvs:/opt/venvs
+    restart: unless-stopped
+
+  # ============================================================================
+  # 4. Headless Blender Worker (Blender 4.2 LTS / bpy Service)
+  #    Handles:
+  #    - Step 1c: Skeleton joint pivot inspection/cleanup & manifold repair
+  #    - Step 2a: Dual Orthographic (Front + Profile) #FF00FF reference render
+  #    - Step 3a: DINOv2 Dataset Generator (ai_anim_plugin.py -> renders + annotations.json)
+  #    - Step 4a: Controlled short validation animation render ("Prueba de Examen")
+  #    - Step 5b: Pose Retargeter (pose_retarget_plugin.py -> Camera Plane / Armature Base)
+  #    - Step 5c: Keyframe Baking & .glb / .gltf / Spritesheet Export
+  # ============================================================================
+  blender-worker:
+    build:
+      context: ./workers/blender
+      dockerfile: Dockerfile.blender
+    container_name: monster-anim-blender
+    init: true
+    expose:
+      - "8002"
+    ports:
+      - "${BLENDER_PORT:-8002}:8002"
+    environment:
+      <<: *common-env
+      BLENDER_ADDONS_DIR: /opt/blender-addons
+    volumes:
+      - ./workspace:/workspace
+      - ./blender-addons:/opt/blender-addons:ro
+    restart: unless-stopped
+
+  # ============================================================================
+  # 5. Standalone Batch Pipeline Runner (CLI Profile)
+  #    Run with: docker compose --profile cli run --build --rm monster-animation
+  # ============================================================================
+  monster-animation:
+    profiles: ["cli"]
+    build:
+      context: ./pipeline
+      dockerfile: Dockerfile
+    init: true
+    working_dir: /app
+    command: ["python", "pipeline_runner.py"]
+    environment:
+      DATASET_PATH: /dataset
+      ANNOTATIONS_PATH: /dataset/${ANNOTATIONS_FILE:-annotations.json}
+      VIDEO_PATH: /inputs/${VIDEO_FILE:-seedance_video.mp4}
+      OUTPUT_DIR: /outputs
+      FEATURE_MODEL: ${FEATURE_MODEL:-dinov2_vits14}
+      EPOCHS: ${EPOCHS:-50}
+      BATCH_SIZE: ${BATCH_SIZE:-16}
+      FRAME_STRIDE: ${FRAME_STRIDE:-1}
+      DEVICE: ${DEVICE:-auto}
+      TORCH_HOME: /cache/torch
+    volumes:
+      - type: bind
+        source: ./workspace/projects/${ACTIVE_PROJECT:-spider-rider}/02-seedance/videos
+        target: /inputs
+        read_only: true
+      - type: bind
+        source: ./workspace/projects/${ACTIVE_PROJECT:-spider-rider}/03-dataset/dinov2
+        target: /dataset
+      - type: bind
+        source: ./engines/dinov2/hubconf.py
+        target: /app/dinov2/hubconf.py
+        read_only: true
+      - type: bind
+        source: ./engines/dinov2/dinov2
+        target: /app/dinov2/dinov2
+        read_only: true
+      - type: bind
+        source: ./workspace/projects/${ACTIVE_PROJECT:-spider-rider}/04-outputs
+        target: /outputs
+      - type: bind
+        source: ./workspace/cache/torch
+        target: /cache/torch
+
+volumes:
+  rigging-venvs:
+    name: monster-anim-rigging-venvs

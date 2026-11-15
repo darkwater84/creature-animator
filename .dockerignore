@@ -1,0 +1,13 @@
+# Ignore heavy workspace datasets, model checkpoints, and virtual environments during Docker builds
+workspace/
+engines/**/venv/
+engines/**/.venv/
+engines/**/.cache/
+engines/**/experiments/
+engines/**/models/
+**/__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.git/
+node_modules/
